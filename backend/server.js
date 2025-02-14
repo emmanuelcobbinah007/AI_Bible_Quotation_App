@@ -1,77 +1,175 @@
 import express from "express";
-import multer from "multer";
-import OpenAI from "openai";
-import cors from "cors";
 import dotenv from "dotenv";
-import path from "path";
+import multer from "multer";
+import cors from "cors";
+import mongoose from "mongoose";
+import axios from "axios";
 import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
 
-// Simulate __dirname in ES module
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = dirname(__filename);
 
-// Load environment variables
-dotenv.config({ path: path.resolve(__dirname, "../.env") });
+dotenv.config({ path: resolve(__dirname, "../.env") });
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// OpenAI configuration
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI);
+
+mongoose.connection.on("connected", () => {
+  console.log("Connected to MongoDB");
 });
 
-// Multer setup for handling audio chunks
-const upload = multer({ storage: multer.memoryStorage() });
+mongoose.connection.on("error", (err) => {
+  console.error("MongoDB connection error:", err);
+});
 
-// Route to handle audio chunks
+// Multer setup for file uploads
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
+
+// Define BibleVerse schema and model
+const bibleVerseSchema = new mongoose.Schema({
+  book: { type: String, required: true },
+  chapter: { type: Number, required: true },
+  verse: { type: Number, required: true },
+  text: { type: String, required: true },
+  version: { type: String, required: true },
+});
+
+const BibleVerse = mongoose.model("BibleVerse", bibleVerseSchema);
+
+// Upload chunk endpoint
 app.post("/upload-chunk", upload.single("audio"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "No file uploaded." });
+  }
+
   try {
     const audioBuffer = req.file.buffer;
-    console.log("Received audio chunk");
+    const transcript = await transcribeAudio(audioBuffer);
+    const detectedVerses = await detectBibleVerses(transcript);
 
-    // Transcribe audio with Whisper API
-    const transcript = await transcribeWithWhisper(audioBuffer);
+    const versesWithText = await Promise.all(
+      detectedVerses.map(async (verse) => ({
+        reference: verse,
+        text: await fetchBibleVerse(verse),
+      }))
+    );
 
-    // Detect Bible verses from the transcript (mock function)
-    const detectedVerses = detectBibleVerses(transcript);
-
-    res.json({ transcript, detectedVerses });
+    res.status(200).json({
+      message: "Chunk uploaded and processed!",
+      transcript,
+      verses: versesWithText,
+    });
   } catch (error) {
-    console.error("Error processing audio chunk:", error);
-    res.status(500).json({ error: "Failed to process audio" });
+    console.error("Error processing audio:", error);
+    res.status(500).json({ error: "Failed to process audio." });
   }
 });
 
-// Start the server
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+app.get("/", (req, res) => {
+  res.send("Server is running!");
 });
 
-// Function to transcribe audio with Whisper API
-async function transcribeWithWhisper(audioBuffer) {
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+});
+
+// Transcribe audio using Deepgram
+async function transcribeAudio(audioBuffer) {
   try {
-    const response = await openai.createTranscription(
+    const response = await axios.post(
+      "https://api.deepgram.com/v1/listen",
       audioBuffer,
-      "whisper-1",
-      "This audio is from a Bible study session. Identify and return Bible verses mentioned, such as 'John 3:16,' 'Romans 8:28,' or 'Psalm 23:1.' If a Bible version is mentioned (e.g., 'NIV,' 'KJV,' 'ESV'), include it in the transcription.",
-      "json",
-      1,
-      "en"
+      {
+        headers: {
+          Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
+          "Content-Type": "audio/wav",
+        },
+        params: {
+          language: "en",
+        },
+      }
     );
-    return response.data.text;
+
+    if (!response.data.results?.channels?.[0]?.alternatives?.[0]?.transcript) {
+      throw new Error("No transcript found in Deepgram response.");
+    }
+
+    return response.data.results.channels[0].alternatives[0].transcript;
   } catch (error) {
-    console.error("Error during transcription:", error);
-    throw new Error("Transcription failed");
+    console.error("Error transcribing with Deepgram:", error);
+    throw new Error("Failed to transcribe audio");
   }
 }
 
-// Mock function to detect Bible verses
-function detectBibleVerses(transcription) {
-  // Add logic to search for Bible verses in the transcript
-  return ["John 3:16", "Romans 8:28"]; // Example detected verses
+// Detect Bible verses using NLP (example)
+async function detectBibleVerses(transcription) {
+  try {
+    const response = await axios.post(
+      "https://api.gemini.com/detect-verses", // Replace with actual API
+      { text: transcription },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.GEMINI_API_KEY}`,
+        },
+      }
+    );
+
+    return response.data.verses || [];
+  } catch (error) {
+    console.error("Error detecting Bible verses:", error);
+    return [];
+  }
+}
+
+// Fetch Bible verse text from MongoDB
+async function fetchBibleVerse(reference) {
+  try {
+    const { book, chapter, startVerse, endVerse } = parseReference(reference);
+
+    const query = {
+      book,
+      chapter,
+      verse: { $gte: startVerse, $lte: endVerse || startVerse },
+      version: "KJV",
+    };
+
+    const verses = await BibleVerse.find(query);
+
+    if (!verses.length) {
+      throw new Error("Verse not found in the database.");
+    }
+
+    return verses.map((v) => v.text).join(" ");
+  } catch (error) {
+    console.error("Error fetching Bible verse from database:", error);
+    return null;
+  }
+}
+
+// Parse Bible reference (e.g., "John 3:16" or "Psalm 23:1-6")
+function parseReference(reference) {
+  const regex = /^(.*?)\s(\d+):(\d+)(?:-(\d+))?$/;
+  const match = reference.match(regex);
+
+  if (!match) {
+    throw new Error("Invalid reference format");
+  }
+
+  const [, book, chapter, startVerse, endVerse] = match;
+  return {
+    book,
+    chapter: parseInt(chapter),
+    startVerse: parseInt(startVerse),
+    endVerse: endVerse ? parseInt(endVerse) : null,
+  };
 }

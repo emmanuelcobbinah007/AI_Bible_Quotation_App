@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { FaMicrophone } from "react-icons/fa";
 import { RiRecordCircleLine } from "react-icons/ri";
 import { BiSolidMicrophoneOff } from "react-icons/bi";
@@ -7,6 +7,9 @@ import { GiSoundWaves } from "react-icons/gi";
 const DisplayBox = () => {
   const [listening, setListening] = useState(false);
   const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [verses, setVerses] = useState([]);
+  const mediaStreamRef = useRef(null);
 
   useEffect(() => {
     if (listening) {
@@ -14,16 +17,17 @@ const DisplayBox = () => {
     } else {
       stopRecording();
     }
+    return () => {
+      stopRecording();
+    };
   }, [listening]);
 
-  const toggleListening = () => {
-    setListening(!listening);
-    console.log(listening ? "Stopped Listening" : "Listening");
-  };
+  const toggleListening = () => setListening((prev) => !prev);
 
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       setMediaRecorder(recorder);
 
@@ -33,49 +37,77 @@ const DisplayBox = () => {
         }
       };
 
-      recorder.start(1000); // Collect audio data in 1-second chunks
+      recorder.start(5000);
     } catch (error) {
       console.error("Failed to start recording:", error);
-      toggleListening();
+      setListening(false);
     }
   };
 
   const stopRecording = () => {
     if (mediaRecorder) {
       mediaRecorder.stop();
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       setMediaRecorder(null);
     }
   };
 
-  const sendChunkToBackend = (audioChunk) => {
+  const sendChunkToBackend = async (audioChunk) => {
+    if (!audioChunk || audioChunk.size === 0) {
+      console.error("Audio chunk is empty or invalid.");
+      return;
+    }
+
     const formData = new FormData();
     formData.append("audio", audioChunk, "chunk.wav");
 
-    fetch("https://your-backend-url.com/upload-audio", {
-      method: "POST",
-      body: formData,
-    })
-      .then((response) => response.json())
-      .then((data) => {
-        console.log("Chunk uploaded successfully:", data);
-      })
-      .catch((error) => {
-        console.error("Failed to upload chunk:", error);
+    setIsUploading(true);
+
+    try {
+      const response = await fetch("http://localhost:5000/upload-chunk", {
+        method: "POST",
+        body: formData,
       });
+
+      setIsUploading(false);
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error("Error response from backend:", errorData);
+      } else {
+        const data = await response.json();
+        console.log("Chunk uploaded successfully:", data);
+        if (data.verses && data.verses.length > 0) {
+          setVerses(data.verses);
+        }
+      }
+    } catch (error) {
+      setIsUploading(false);
+      console.error("Failed to upload chunk:", error);
+    }
   };
 
   return (
     <div>
-      <div className="text-center max-w-[90%] md:max-w-[700px] mx-auto mt-[70px] md:mt-[110px] p-4 hidden">
-        <div className="text-xl md:text-2xl font-semibold">
-          Romans 8:28 <span>(NIV)</span>
-        </div>
-        <div className="text-lg md:text-2xl">
-          And we know that in all things God works for the good of those who
-          love him, who have been called according to his purpose.
-        </div>
+      {/* Bible Verse Section */}
+      <div className="text-center max-w-[90%] md:max-w-[700px] mx-auto mt-[70px] md:mt-[110px] p-4">
+        {verses.length > 0 ? (
+          verses.map((verse, index) => (
+            <div key={index}>
+              <div className="text-xl md:text-2xl font-semibold">
+                {verse.reference} <span>(KJV)</span>
+              </div>
+              <div className="text-lg md:text-2xl">{verse.text}</div>
+            </div>
+          ))
+        ) : (
+          <div className="hidden text-lg md:text-2xl text-gray-500">
+            No verses detected yet.
+          </div>
+        )}
       </div>
 
+      {/* Main Content */}
       <div
         className={`flex flex-col justify-center items-center space-y-4 bg-white p-4 rounded-3xl w-[90%] md:w-[70%] lg:w-[60%] xl:w-[50%] mt-4 text-center text-sm md:text-base mx-auto`}
         style={{
@@ -93,6 +125,11 @@ const DisplayBox = () => {
             ? "Listening and detecting Bible quotations in real time..."
             : "Transcribing and detecting Bible quotations in real time."}
         </p>
+
+        {isUploading && (
+          <div className="text-sm text-gray-500">Uploading...</div>
+        )}
+
         <button
           className={`flex items-center justify-center text-sm md:text-md rounded-full py-2 px-6 transition-transform transform hover:scale-105 focus:outline-none duration-400 hover:shadow-lg ${
             listening
